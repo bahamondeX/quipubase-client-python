@@ -49,10 +49,10 @@ class Collection(BaseModel):
 
 	@classmethod
 	def col_id(cls):
-		return encrypt(json.dumps(cls.model_json_schema()))
+		return encrypt(json.dumps(cls.model_json_schema(), sort_keys=True))
 
 	@classmethod
-	def tool_definition(cls) -> dict[str, Any]:
+	def openai_tool(cls) -> dict[str, Any]:
 		return {
 			"type": "function",
 			"function": {
@@ -63,7 +63,7 @@ class Collection(BaseModel):
 		}
 
 	@classmethod
-	def tool_param(cls):
+	def anthropic_tool(cls) -> dict[str, Any]:
 		return dict(
 			input_schema=cls.model_json_schema(),
 			name=cls.__name__,

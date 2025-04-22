@@ -1,5 +1,7 @@
 import json
+import asyncio
 import typing as tp
+import uuid
 from dataclasses import dataclass, field
 
 from httpx import AsyncClient, Response
@@ -8,13 +10,24 @@ from pydantic import BaseModel
 from .event import Event
 from .partial import Partial
 from .proxy import LazyProxy
-from .schemas import Collection
-from .typedefs import CollectionType, JsonSchema, Request
-from .utils import get_logger, handle
+from .typedefs import CollectionMetadataType, CollectionType, JsonSchema, Request, Collection, Response as QResponse
+from .utils import get_logger
 
 T = tp.TypeVar("T", bound=Collection)
 
 logger = get_logger(__name__)
+
+class UUIDEncoder(json.JSONEncoder):
+    """
+    Custom JSON encoder for UUID objects.
+    
+    This encoder converts UUID objects to their string representation when
+    serializing to JSON.
+    """
+    def default(self, o: tp.Any) -> tp.Any:
+        if isinstance(o, uuid.UUID):
+            return str(o)
+        return super().default(o)
 
 @dataclass
 class QuipuBase(tp.Generic[T], LazyProxy[AsyncClient]):
@@ -25,14 +38,28 @@ class QuipuBase(tp.Generic[T], LazyProxy[AsyncClient]):
     responses. It uses the `httpx` library for making HTTP requests and
     supports both synchronous and asynchronous operations.
     """
-    base_url: str = field(default="https://db.oscarbahamonde.cloud")
+    base_url: str = field(default="https://quipubase.online")
    
   
     def __load__(self):
         return AsyncClient(base_url=self.base_url)
+
+    @classmethod
+    def __class_getitem__(cls, item: tp.Type[T]):
+        """
+        Allows for dynamic typing of the class based on the provided item.
+        
+        Args:
+            item: The item to use for dynamic typing
+            
+        Returns:
+            The class itself
+        """
+        cls._model = item
+        return cls
     
     async def fetch(self, endpoint: str, method: tp.Literal["GET", "POST", "PUT", "DELETE"], headers:dict[str,str]={"Content-Type": "application/json", "Accept": "application/json"},
-                   json: tp.Optional[tp.Union[JsonSchema, T, Partial[T]]] = None, 
+                   data: tp.Optional[tp.Union[JsonSchema, T, Partial[T], Request[T]]] = None, 
                    params: tp.Optional[dict[str,tp.Any]] = None) -> Response:
         """
         Base request method for API calls.
@@ -46,15 +73,17 @@ class QuipuBase(tp.Generic[T], LazyProxy[AsyncClient]):
         Returns:
             Parsed JSON response as dict
         """
-        if isinstance(json, BaseModel):
-            data = json.model_dump(exclude_none=True)
+        if isinstance(data, BaseModel):
+            d = data.model_dump(exclude_none=True)
+        elif isinstance(data, Partial):
+            d = data.data
         else:
-            data = json
+            d = data
         try:
             response = await self.__load__().request(
                 method=method,
                 url=endpoint,
-                json=data,
+                json=json.loads(json.dumps(d, cls=UUIDEncoder)) if d else None,
                 params=params,
                 headers=headers
             )
@@ -62,7 +91,7 @@ class QuipuBase(tp.Generic[T], LazyProxy[AsyncClient]):
         except Exception as e:
             logger.error("Error in API request: %s", e)
             raise
-    @handle
+
     async def create_collection(self, schema: T) -> CollectionType:
         """
         Create a new collection.
@@ -73,10 +102,10 @@ class QuipuBase(tp.Generic[T], LazyProxy[AsyncClient]):
         Returns:
             Created collection information
         """
-        response = await self.fetch("/v1/collections", "POST", json=schema)
+        response = await self.fetch("/v1/collections", "POST", data=schema)
         return CollectionType(**response.json())
-    @handle
-    async def list_collections(self, limit: int = 100, offset: int = 0) -> list[str]:
+
+    async def list_collections(self):
         """
         List all collections with pagination.
         
@@ -87,9 +116,9 @@ class QuipuBase(tp.Generic[T], LazyProxy[AsyncClient]):
         Returns:
             List of collection IDs
         """
-        response = await self.fetch("/v1/collections", "GET", params={"limit": limit, "offset": offset})
-        return response.json()
-    @handle
+        response = await self.fetch("/v1/collections", "GET")
+        return [CollectionMetadataType(d) for d in response.json()]
+
     async def get_collection(self, collection_id: str) -> CollectionType:
         """
         Get a specific collection by ID.
@@ -102,7 +131,7 @@ class QuipuBase(tp.Generic[T], LazyProxy[AsyncClient]):
         """
         response = await self.fetch(f"/v1/collections/{collection_id}", "GET")
         return CollectionType(**response.json())
-    @handle
+
     async def delete_collection(self, collection_id: str) -> dict[str, bool]:
         """
         Delete a collection by ID.
@@ -115,60 +144,61 @@ class QuipuBase(tp.Generic[T], LazyProxy[AsyncClient]):
         """
         response = await self.fetch(f"/v1/collections/{collection_id}", "DELETE")
         return response.json()
-    
-    @handle
-    async def collection_action(self, col_id: str, action: Request[T]) -> dict[str, tp.Any]:
-        """
-        Perform a unified action on a collection.
-        
-        Args:
-            collection_id: ID of the collection
-            action: Action request with event type and data
-            
-        Returns:
-            Action response
-        """
-        assert action.data is not None, "Data must be provided for the action"
-        response = await self.fetch(f"/v1/collections/{col_id}", "PUT", json=action.data)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            logger.error("Error in collection action: %s", response.text)
-            raise Exception(f"Error in collection action: {response.status_code} - {response.text}")
 
-    @handle
-    async def pub(self, col_id:str, request: Request[T])->dict[str, tp.Any]:
+
+    async def pub(self, col_id: str, request: Request[T]) -> QResponse[T]:
         """
         Publish data to a collection.
         
         Args:
-            collection_id: ID of the collection
-            data: Data to publish
+            col_id: ID of the collection
+            request: Request with data and event
             
         Returns:
             Published data information
         """
         assert request.data is not None, "Data must be provided for publishing"
-        response = await self.fetch(f"/v1/collections/{col_id}", "POST", json=request.data)
-        return response.raise_for_status().json()
+        
+        # Structure the action request according to the API's expectations
+        action_request:dict[str,tp.Any] = {
+            "event": request.event,  # create, read, update, delete, query, stop
+            "data": request.data.model_dump(exclude_unset=True,exclude_none=True) if isinstance(request.data, BaseModel) else request.data
+        }
+        
+        response = await self.fetch(f"/v1/events/{col_id}", "POST", data=action_request) # type: ignore
+        data = self._model.model_validate(response.json()["data"])
+        return QResponse[T](col_id=col_id, data=data)
 
-
-    async def sub(self, col_id:str):
+    async def sub(self, col_id: str):
         """
-        Subscribe to a collection.
+        Subscribe to a collection with infinite retry.
         
         Args:
-            collection_id: ID of the collection
+            col_id: ID of the collection
             
-        Returns:
-            Subscription information
+        Yields:
+            Event objects from the stream
         """
-        async with self.__load__().stream(f"/v1/events/{col_id}", "GET") as response:
-            async for chunk in response.raise_for_status().aiter_lines():
-                if chunk:
-                    chunk = chunk.replace("data: ", "")
-                    try:
-                        yield Event[T](**json.loads(chunk))
-                    except json.JSONDecodeError as e:
-                        logger.error("Error decoding JSON: %s", e)
-                        continue
+        logger.info("Subscribing to events for collection %s", col_id)
+        client = AsyncClient(
+                    base_url=self.base_url,
+                    timeout=None  # No timeout
+                )
+        while True:
+            try:
+                async with client.stream("GET", f"/v1/events/{col_id}", 
+                                        headers={"Accept":"application/json"}) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_lines():
+                        if chunk:
+                            try:
+                                yield Event[T](**json.loads(chunk.strip()))
+                            except json.JSONDecodeError as e:
+                                logger.error("Error decoding JSON: %s", e)
+                                continue
+            except Exception as e:
+                logger.error("Subscription error: %s", e)
+                await asyncio.sleep(1)
+                continue
+            finally:
+                await client.aclose()
